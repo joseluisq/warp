@@ -17,13 +17,14 @@ use headers::{
     AcceptRanges, ContentLength, ContentRange, ContentType, HeaderMapExt, IfModifiedSince, IfRange,
     IfUnmodifiedSince, LastModified, Range,
 };
-use http::StatusCode;
+use http::{Method, StatusCode};
 use hyper::Body;
 use mime_guess;
 use tokio::fs::File as TkFile;
 use tokio::io::AsyncRead;
 use urlencoding::decode;
 
+use super::method;
 use crate::filter::{Filter, FilterClone, One};
 use crate::reject::{self, Rejection};
 use crate::reply::{Reply, Response};
@@ -52,7 +53,8 @@ pub fn file(path: impl Into<PathBuf>) -> impl FilterClone<Extract = One<File>, E
             ArcPath(path.clone())
         })
         .and(conditionals())
-        .and_then(|path, conditionals| file_reply(path, conditionals))
+        .and(method::method())
+        .and_then(|path, conditionals, method| file_reply(path, conditionals, method))
 }
 
 /// Creates a `Filter` that serves a directory at the base `path` joined
@@ -79,10 +81,11 @@ pub fn file(path: impl Into<PathBuf>) -> impl FilterClone<Extract = One<File>, E
 /// ```
 pub fn dir(path: impl Into<PathBuf>) -> impl FilterClone<Extract = One<File>, Error = Rejection> {
     let base = Arc::new(path.into());
-    crate::get()
+    crate::any()
         .and(path_from_tail(base))
         .and(conditionals())
-        .and_then(file_reply)
+        .and(method::method())
+        .and_then(|path, conditionals, method| file_reply(path, conditionals, method))
 }
 
 fn path_from_tail(
@@ -259,9 +262,10 @@ impl Reply for File {
 fn file_reply(
     path: ArcPath,
     conditionals: Conditionals,
+    method: Method,
 ) -> impl Future<Output = Result<File, Rejection>> + Send {
     TkFile::open(path.clone()).then(move |res| match res {
-        Ok(f) => Either::Left(file_conditional(f, path, conditionals)),
+        Ok(f) => Either::Left(file_conditional(f, path, conditionals, method)),
         Err(err) => {
             let rej = match err.kind() {
                 io::ErrorKind::NotFound => {
@@ -300,6 +304,7 @@ fn file_conditional(
     f: TkFile,
     path: ArcPath,
     conditionals: Conditionals,
+    method: Method,
 ) -> impl Future<Output = Result<File, Rejection>> + Send {
     file_metadata(f).map_ok(move |(file, meta)| {
         let mut len = meta.len();
@@ -308,6 +313,22 @@ fn file_conditional(
         let resp = match conditionals.check(modified) {
             Cond::NoBody(resp) => resp,
             Cond::WithBody(range) => {
+                if method == &Method::HEAD {
+                    let mut resp = Response::new(Body::empty());
+
+                    let mime = mime_guess::from_path(path.as_ref()).first_or_octet_stream();
+
+                    resp.headers_mut().typed_insert(ContentLength(len));
+                    resp.headers_mut().typed_insert(ContentType::from(mime));
+                    resp.headers_mut().typed_insert(AcceptRanges::bytes());
+
+                    if let Some(last_modified) = modified {
+                        resp.headers_mut().typed_insert(last_modified);
+                    }
+
+                    return File { resp, path };
+                }
+
                 bytes_range(range, len)
                     .map(|(start, end)| {
                         let sub_len = end - start;
