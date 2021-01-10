@@ -155,6 +155,42 @@ pub fn exact(
     })
 }
 
+/// Create a `Filter` that requires the value of a header contains a
+/// specific occurrence.
+/// This `Filter` will look for a header with supplied name and if its
+/// value at least contains a match, otherwise rejects the request.
+///
+/// # Example
+///
+/// ```
+/// // A header `accept-encoding: gzip, deflate, br` that at least contains `gzip`.
+/// let must_dnt = warp::header::contains("accept-encoding", "gzip");
+/// ```
+pub fn contains(
+    name: &'static str,
+    occurrence: &'static str,
+) -> impl Filter<Extract = (), Error = Rejection> + Copy {
+    filter_fn(move |route| {
+        tracing::trace!("contains?({:?}, {:?})", name, occurrence);
+        let route = route
+            .headers()
+            .get(name)
+            .ok_or_else(|| reject::missing_header(name))
+            .and_then(|val| {
+                let val = match val.to_str() {
+                    Ok(v) => v,
+                    _ => return Err(reject::invalid_header(name)),
+                };
+                if val.contains(occurrence) {
+                    Ok(())
+                } else {
+                    Err(reject::invalid_header(name))
+                }
+            });
+        future::ready(route)
+    })
+}
+
 /// Create a `Filter` that requires a header to match the value exactly.
 ///
 /// This `Filter` will look for a header with supplied name and the exact
