@@ -42,26 +42,6 @@ pub struct Compression<F> {
 // TODO: The implementation of `gzip()`, `deflate()`, and `brotli()` could be replaced with
 // generics or a macro
 
-/// Contains a common fixed list of text-based MIME types in order to apply compression.
-pub const TEXT_MIME_TYPES: [&str; 16] = [
-    "text/html",
-    "text/css",
-    "text/javascript",
-    "text/xml",
-    "text/plain",
-    "text/x-component",
-    "application/javascript",
-    "application/x-javascript",
-    "application/json",
-    "application/xml",
-    "application/rss+xml",
-    "application/atom+xml",
-    "font/truetype",
-    "font/opentype",
-    "application/vnd.ms-fontobject",
-    "image/svg+xml",
-];
-
 /// Create a wrapping filter that compresses the Body of a [`Response`](crate::reply::Response)
 /// using gzip, adding `content-encoding: gzip` to the Response's [`HeaderMap`](hyper::HeaderMap)
 ///
@@ -75,19 +55,8 @@ pub const TEXT_MIME_TYPES: [&str; 16] = [
 ///     .and(warp::fs::file("./README.md"))
 ///     .with(warp::compression::gzip());
 /// ```
-pub fn gzip(
-    text_based_mime_types_only: bool,
-) -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
+pub fn gzip() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
     let func = move |mut props: CompressionProps| {
-        // Check for common text-based MIME types only to apply compression
-        if text_based_mime_types_only {
-            if let Some(content_type) = props.head.headers.get("content-type") {
-                let apply_gzip = TEXT_MIME_TYPES.iter().any(|h| h == content_type);
-                if !apply_gzip {
-                    return Response::from_parts(props.head, Body::wrap_stream(props.body));
-                }
-            }
-        }
         let body = Body::wrap_stream(ReaderStream::new(GzipEncoder::new(StreamReader::new(
             props.body,
         ))));
@@ -114,19 +83,8 @@ pub fn gzip(
 ///     .and(warp::fs::file("./README.md"))
 ///     .with(warp::compression::deflate());
 /// ```
-pub fn deflate(
-    text_based_mime_types_only: bool,
-) -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
+pub fn deflate() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
     let func = move |mut props: CompressionProps| {
-        if text_based_mime_types_only {
-            // Check for common text-based MIME types only to apply compression
-            if let Some(content_type) = props.head.headers.get("content-type") {
-                let apply_gzip = TEXT_MIME_TYPES.iter().any(|h| h == content_type);
-                if !apply_gzip {
-                    return Response::from_parts(props.head, Body::wrap_stream(props.body));
-                }
-            }
-        }
         let body = Body::wrap_stream(ReaderStream::new(DeflateEncoder::new(StreamReader::new(
             props.body,
         ))));
@@ -153,19 +111,8 @@ pub fn deflate(
 ///     .and(warp::fs::file("./README.md"))
 ///     .with(warp::compression::brotli());
 /// ```
-pub fn brotli(
-    text_based_mime_types_only: bool,
-) -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
+pub fn brotli() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
     let func = move |mut props: CompressionProps| {
-        if text_based_mime_types_only {
-            // Check for common text-based MIME types only to apply compression
-            if let Some(content_type) = props.head.headers.get("content-type") {
-                let apply_gzip = TEXT_MIME_TYPES.iter().any(|h| h == content_type);
-                if !apply_gzip {
-                    return Response::from_parts(props.head, Body::wrap_stream(props.body));
-                }
-            }
-        }
         let body = Body::wrap_stream(ReaderStream::new(BrotliEncoder::new(StreamReader::new(
             props.body,
         ))));
