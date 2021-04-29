@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use bytes::{Bytes, BytesMut};
+use chrono;
 use futures::future::Either;
 use futures::{future, ready, stream, FutureExt, Stream, StreamExt, TryFutureExt};
 use headers::{
@@ -18,6 +19,7 @@ use headers::{
     IfUnmodifiedSince, LastModified, Range,
 };
 use http::StatusCode;
+use humansize::{file_size_opts, FileSize};
 use hyper::Body;
 use mime_guess;
 use percent_encoding::percent_decode_str;
@@ -85,7 +87,14 @@ pub fn dir(path: impl Into<PathBuf>) -> impl FilterClone<Extract = One<File>, Er
         .unify()
         .and(path_from_tail(base))
         .and(conditionals())
-        .and_then(file_reply)
+        .and_then(move |path: ArcPath, conditionals: Conditionals| async {
+            // TODO: of course this is just an experiment but I'm not really sure about it
+            // if let Some(res) = file_reply_listing(path, conditionals, dir_listing) {
+            //     res.await
+            // } else {
+            file_reply(path, conditionals).await
+            // }
+        })
 }
 
 fn path_from_tail(
@@ -258,11 +267,138 @@ impl Reply for File {
     }
 }
 
+fn parse_last_modified(
+    modified: std::time::SystemTime,
+) -> Result<chrono::DateTime<chrono::Utc>, Box<dyn std::error::Error>> {
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH)?;
+    // HTTP times don't have nanosecond precision, so we truncate
+    // the modification time.
+    // Converting to i64 should be safe until we get beyond the
+    // planned lifetime of the universe
+    //
+    // TODO: Investigate how to write a test for this. Changing
+    // the modification time of a file with greater than second
+    // precision appears to be something that only is possible to
+    // do on Linux.
+    let naive = chrono::NaiveDateTime::from_timestamp(since_epoch.as_secs() as i64, 0);
+    Ok(chrono::DateTime::from_utc(naive, chrono::Utc))
+}
+
+fn file_reply_listing(
+    path: ArcPath,
+    conditionals: Conditionals,
+    dir_listing: bool,
+) -> Option<impl Future<Output = Result<File, Rejection>> + Send> {
+    // 1. Check if "directory listing" feature is enabled,
+    // if current path is a valid directory and
+    // if it does not contain an `index.html` file
+
+    // TODO: determine if the request maps to a dir
+    if dir_listing && path.as_ref().is_dir() && !path.as_ref().join("index.html").exists() {
+        return None;
+    }
+
+    // TODO: Redirect if current path does not end with a slash
+
+    let current_path = "/";
+
+    Some(async move {
+        let mut read_dir = read_dir(path.as_ref().parent().unwrap()).await.unwrap();
+
+        // Read current directory and create the index page content
+        let mut entries_str = String::new();
+        if current_path != "/" {
+            entries_str = String::from("<tr><td colspan=\"3\"><a href=\"../\">../</a></td></tr>");
+        }
+
+        while let Some(entry) = read_dir.next_entry().await.unwrap() {
+            let (entry, meta) = dir_metadata(entry).await.unwrap();
+            let mut filesize = meta.len().file_size(file_size_opts::DECIMAL).unwrap();
+            let mut name = entry.file_name().into_string().unwrap();
+            if meta.is_dir() {
+                name = format!("{}/", name);
+                filesize = String::from("-")
+            }
+
+            let uri = format!("{}{}", current_path, name);
+            let modified = parse_last_modified(meta.modified().ok().unwrap()).unwrap();
+            let modified = modified.format("%F %T");
+
+            entries_str = format!(
+                "{}<tr><td><a href=\"{}\" title=\"{}\">{}</a></td><td style=\"width: 160px;\">{}</td><td align=\"right\" style=\"width: 140px;\">{}</td></tr>",
+                entries_str,
+                uri,
+                name,
+                name,
+                modified,
+                filesize
+            );
+        }
+
+        let current_path = percent_decode_str(&current_path)
+            .decode_utf8()
+            .unwrap()
+            .to_string();
+        let page_str = format!(
+                "<html><head><meta charset=\"utf-8\"><title>Index of {}</title></head><body><h1>Index of {}</h1><table style=\"min-width:680px;\"><tr><th colspan=\"3\"><hr></th></tr>{}<tr><th colspan=\"3\"><hr></th></tr></table></body></html>", current_path, current_path, entries_str
+            );
+        let mut len = page_str.len() as u64;
+        let modified = Some(std::time::SystemTime::now()).map(LastModified::from);
+
+        let resp = match conditionals.check(modified) {
+            Cond::NoBody(resp) => resp,
+            Cond::WithBody(range) => {
+                bytes_range(range, len)
+                    .map(|(start, end)| {
+                        let sub_len = end - start;
+                        // let buf_size = DEFAULT_READ_BUF_SIZE;
+                        // let stream = file_stream(file, buf_size, (start, end));
+                        // let body = Body::wrap_stream(stream);
+
+                        let mut resp = Response::new(page_str.into());
+
+                        if sub_len != len {
+                            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                            resp.headers_mut().typed_insert(
+                                ContentRange::bytes(start..end, len).expect("valid ContentRange"),
+                            );
+
+                            len = sub_len;
+                        }
+
+                        let mime = mime_guess::from_path(path.as_ref()).first_or_octet_stream();
+
+                        resp.headers_mut().typed_insert(ContentLength(len));
+                        resp.headers_mut().typed_insert(ContentType::from(mime));
+                        resp.headers_mut().typed_insert(AcceptRanges::bytes());
+
+                        if let Some(last_modified) = modified {
+                            resp.headers_mut().typed_insert(last_modified);
+                        }
+
+                        resp
+                    })
+                    .unwrap_or_else(|BadRange| {
+                        // bad byte range
+                        let mut resp = Response::new(Body::empty());
+                        *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                        resp.headers_mut()
+                            .typed_insert(ContentRange::unsatisfied_bytes(len));
+                        resp
+                    })
+            }
+        };
+
+        return Ok(File { resp, path });
+    })
+}
+
+// TODO: move the normal file response into its own filter
 fn file_reply(
     path: ArcPath,
     conditionals: Conditionals,
 ) -> impl Future<Output = Result<File, Rejection>> + Send {
-    TkFile::open(path.clone()).then(move |res| match res {
+    let a = TkFile::open(path.clone()).then(move |res| match res {
         Ok(f) => Either::Left(file_conditional(f, path, conditionals)),
         Err(err) => {
             let rej = match err.kind() {
@@ -285,7 +421,9 @@ fn file_reply(
             };
             Either::Right(future::err(rej))
         }
-    })
+    });
+
+    a
 }
 
 async fn file_metadata(f: TkFile) -> Result<(TkFile, Metadata), Rejection> {
@@ -293,6 +431,28 @@ async fn file_metadata(f: TkFile) -> Result<(TkFile, Metadata), Rejection> {
         Ok(meta) => Ok((f, meta)),
         Err(err) => {
             tracing::debug!("file metadata error: {}", err);
+            Err(reject::not_found())
+        }
+    }
+}
+
+async fn dir_metadata(
+    f: tokio::fs::DirEntry,
+) -> Result<(tokio::fs::DirEntry, Metadata), Rejection> {
+    match f.metadata().await {
+        Ok(meta) => Ok((f, meta)),
+        Err(err) => {
+            tracing::debug!("dir entry metadata error: {}", err);
+            Err(reject::not_found())
+        }
+    }
+}
+
+async fn read_dir(path: &Path) -> Result<tokio::fs::ReadDir, Rejection> {
+    match tokio::fs::read_dir(path).await {
+        Ok(readir) => Ok(readir),
+        Err(err) => {
+            tracing::debug!("dir reading error: {}", err);
             Err(reject::not_found())
         }
     }
